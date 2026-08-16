@@ -11,8 +11,8 @@ void Raft::on_election_timeout() {
     become_candidate();
     //Build args once
     RequestVoteArgs args;
-    args.term           = hard_.current_term;
-    args.candidate_id   = cfg_.self_id;
+    args.term  = hard_.current_term;
+    args.candidate_id = cfg_.self_id;
     args.last_log_index = log_.last_index();
     args.last_log_term  = log_.last_term();
     // Capture the term  campaign in. If a callback arrives late after 
