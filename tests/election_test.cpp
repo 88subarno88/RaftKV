@@ -154,10 +154,11 @@ TEST(Election, HigherTermCausesStepDown) {
     TestCluster c(3);
     c.run_for(500); // Elect a leader
 
-    auto& leader_raft = c.nodes[0]->raft;
+    // Raw pointer, not a reference: we need to rebind it as we scan for the leader.
+    Raft* leader_raft = c.nodes[0]->raft.get();
     // Force find the leader
     for (auto& n : c.nodes) {
-        if (n->raft->role() == Role::Leader) leader_raft = n->raft;
+        if (n->raft->role() == Role::Leader) leader_raft = n->raft.get();
     }
     Term current = leader_raft->current_term();
     // Fabricate an RPC from some rogue node with a massively higher term

@@ -11,10 +11,8 @@ add_library(raft_core
     src/raft/election.cpp
     src/raft/replication.cpp
     src/raft/snapshot.cpp
-    src/kv/kv_state_machine.cpp           # Fixed relative path
     src/storage/wal.cpp
     src/storage/snapshot_store.cpp
-    src/transport/mock_transport.cpp
 )
 target_include_directories(raft_core PUBLIC include)
 

@@ -4,6 +4,8 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <random>
+#include <cstdint>
 
 namespace raftkv {
 
@@ -30,124 +32,181 @@ public:
 };
 
 
-
-class MockTransport; // Forward declaration
-
-// The central "Switch" that connects all mock transports together.
-// In  tests, you  tell this network to drop packets, delay them, or 
-// sever connections between specific nodes (network partitions).
-class MockNetwork {
+// Test Harness
+// A deterministic, virtual-time simulation of the network. Tests drive it by
+// calling step() to advance the clock and deliver whatever is due; fault
+// injection (partitions, drops, latency) is configured via the knobs below.
+//
+// Defined here rather than in a .cpp because dispatch_rpc() is a template that
+// tests instantiate, and because the tests construct these types directly.
+class Network {
 public:
-    void register_node(NodeId id, MockTransport* transport) {
-        endpoints_[id] = transport;
+    Network() = default;
+
+    // Register a node's inbound handlers under its id
+    void attach(NodeId id, RpcHandlers h) {
+        handlers_[id] = std::move(h);
     }
 
-    // Network manipulation for tests
-    void isolate_node(NodeId id, bool isolated) {
-        isolated_[id] = isolated;
+    // Fault injection knobs the tests toggle
+
+    // Isolate groups. Nodes can only talk to others in the same sub-vector
+    void partition(const std::vector<std::vector<NodeId>>& groups) {
+        partitions_.clear();
+        int group_id = 1;
+        for (const auto& group : groups) {
+            for (NodeId id : group) {
+                partitions_[id] = group_id;
+            }
+            group_id++;
+        }
     }
 
-    // Routing functions called by the sender's MockTransport
-    void route_request_vote(NodeId from, NodeId to, const RequestVoteArgs& args,
-                            std::function<void(const RequestVoteReply&)> cb);
-    void route_append_entries(NodeId from, NodeId to, const AppendEntriesArgs& args,
-                              std::function<void(const AppendEntriesReply&)> cb);      
-    void route_install_snapshot(NodeId from, NodeId to, const InstallSnapshotArgs& args,
-                                std::function<void(const InstallSnapshotReply&)> cb);
+    // Full connectivity
+    void heal() {
+        partitions_.clear();
+    }
+
+    // Random loss (0.0 to 1.0)
+    void set_drop_rate(double p) {
+        drop_rate_ = p;
+    }
+
+    // Random delay range in ms
+    void set_latency(int ms_min, int ms_max) {
+        lat_min_ = ms_min;
+        lat_max_ = ms_max;
+    }
+
+    // Partition check
+    bool reachable(NodeId from, NodeId to) const {
+        if (partitions_.empty()) return true; // Healed state
+
+        auto it_from = partitions_.find(from);
+        auto it_to = partitions_.find(to);
+
+        // If they are explicitly in the same partition group, they can talk
+        if (it_from != partitions_.end() && it_to != partitions_.end()) {
+            return it_from->second == it_to->second;
+        }
+
+        // If partitions are active, unlisted nodes are isolated
+        return false;
+    }
+
+    // Deliver queued messages
+    void step(uint64_t ms = 10) {
+        current_time_ += ms;
+        // Pop and execute all messages due at or before current_time_
+        while (!queue_.empty() && queue_.begin()->first <= current_time_) {
+            auto task = std::move(queue_.begin()->second);
+            queue_.erase(queue_.begin());
+            task();
+        }
+    }
+
+    // Helper to simulate the 2-way RPC trip with delays, drops, and partitions
+    template<typename Args, typename Reply>
+    void dispatch_rpc(NodeId from, NodeId to, const Args& args,
+                      std::function<Reply(const Args&)> rpc_handler,
+                      std::function<void(const Reply&)> callback) {
+
+        if (!reachable(from, to) || should_drop()) return;
+
+        uint64_t req_time = current_time_ + get_latency();
+
+        // Schedule Request Delivery
+        queue_.insert({req_time, [this, from, to, args, rpc_handler, callback]() {
+            // Re-check partitions at delivery time
+            if (!reachable(from, to)) return;
+
+            // Execute on target node
+            Reply reply = rpc_handler(args);
+
+            // Schedule Reply Delivery
+            if (!reachable(to, from) || should_drop()) return;
+
+            uint64_t rep_time = current_time_ + get_latency();
+            queue_.insert({rep_time, [this, from, to, reply, callback]() {
+                // Re-check partitions at reply delivery time
+                if (!reachable(to, from)) return;
+                callback(reply);
+            }});
+        }});
+    }
+
+    RpcHandlers& get_handlers(NodeId id) { return handlers_[id]; }
 
 private:
-    std::map<NodeId, MockTransport*> endpoints_;
-    std::map<NodeId, bool> isolated_; // true if node is partitioned
-    
-    bool can_communicate(NodeId from, NodeId to) {
-        return !isolated_[from] && !isolated_[to];
+    bool should_drop() {
+        if (drop_rate_ <= 0.0) return false;
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return dist(rng_) < drop_rate_;
     }
+
+    uint64_t get_latency() {
+        if (lat_min_ >= lat_max_) return lat_min_;
+        std::uniform_int_distribution<uint64_t> dist(lat_min_, lat_max_);
+        return dist(rng_);
+    }
+
+    std::map<NodeId, RpcHandlers> handlers_;
+    std::map<NodeId, int> partitions_;
+
+    double   drop_rate_ = 0.0;
+    uint64_t lat_min_   = 0;
+    uint64_t lat_max_   = 0;
+
+    std::mt19937 rng_{42};       // Fixed seed: tests must be reproducible
+    uint64_t     current_time_ = 0;
+
+    // Priority queue of pending closures sorted by due-time
+    std::multimap<uint64_t, std::function<void()>> queue_;
 };
 
-// The endpoint that lives inside each Raft node.
+// The per-node Transport that talks to the shared Network.
 class MockTransport : public Transport {
 public:
-    MockTransport(NodeId me, MockNetwork* network, std::vector<NodeId> peers)
-        : me_(me), network_(network), peers_(std::move(peers)) {
-        network_->register_node(me_, this);
+    MockTransport(NodeId self, std::vector<NodeId> peers, Network* net)
+        : self_(self), peers_(std::move(peers)), net_(net) {}
+
+    void set_handlers(RpcHandlers h) override {
+        net_->attach(self_, std::move(h));
     }
 
-    void set_handlers(RpcHandlers handlers) override {
-        handlers_ = std::move(handlers);
-    }
-
-    void send_request_vote(NodeId to, const RequestVoteArgs& args,
+    void send_request_vote(NodeId to, const RequestVoteArgs& a,
                            std::function<void(const RequestVoteReply&)> cb) override {
-        // Delegate routing to the central network
-        network_->route_request_vote(me_, to, args, std::move(cb));
+        net_->dispatch_rpc<RequestVoteArgs, RequestVoteReply>(
+            self_, to, a,
+            [this, to](const RequestVoteArgs& args) { return net_->get_handlers(to).on_request_vote(args); },
+            cb
+        );
     }
 
-    void send_append_entries(NodeId to, const AppendEntriesArgs& args,
+    void send_append_entries(NodeId to, const AppendEntriesArgs& a,
                              std::function<void(const AppendEntriesReply&)> cb) override {
-        network_->route_append_entries(me_, to, args, std::move(cb));
+        net_->dispatch_rpc<AppendEntriesArgs, AppendEntriesReply>(
+            self_, to, a,
+            [this, to](const AppendEntriesArgs& args) { return net_->get_handlers(to).on_append_entries(args); },
+            cb
+        );
     }
 
-    void send_install_snapshot(NodeId to, const InstallSnapshotArgs& args,
+    void send_install_snapshot(NodeId to, const InstallSnapshotArgs& a,
                                std::function<void(const InstallSnapshotReply&)> cb) override {
-        network_->route_install_snapshot(me_, to, args, std::move(cb));
+        net_->dispatch_rpc<InstallSnapshotArgs, InstallSnapshotReply>(
+            self_, to, a,
+            [this, to](const InstallSnapshotArgs& args) { return net_->get_handlers(to).on_install_snapshot(args); },
+            cb
+        );
     }
 
-    const std::vector<NodeId>& peers() const override {
-        return peers_;
-    }
-
-    // Called by the network to deliver an incoming RPC to this node
-    RpcHandlers& get_handlers() { return handlers_; }
+    const std::vector<NodeId>& peers() const override { return peers_; }
 
 private:
-    NodeId me_;
-    MockNetwork* network_;
+    NodeId self_;
     std::vector<NodeId> peers_;
-    RpcHandlers handlers_;
+    Network* net_;
 };
 
-//MockNetwork Routing Implementation
-
-inline void MockNetwork::route_request_vote(NodeId from, NodeId to, const RequestVoteArgs& args,
-                                            std::function<void(const RequestVoteReply&)> cb) {
-    if (!can_communicate(from, to)) return; // Drop packet silently (simulating network partition)
-    
-    auto receiver_it = endpoints_.find(to);
-    if (receiver_it != endpoints_.end() && receiver_it->second->get_handlers().on_request_vote) {
-        // Execute receiver's handler and immediately invoke the sender's callback.
-        // In a true async simulator,  would push this into an event queue 
-        // rather than executing it synchronously.
-        RequestVoteReply reply = receiver_it->second->get_handlers().on_request_vote(args);
-        
-        if (can_communicate(to, from)) { // Check if reply route is also open
-            cb(reply);
-        }
-    }
 }
-
-inline void MockNetwork::route_append_entries(NodeId from, NodeId to, const AppendEntriesArgs& args,
-                                              std::function<void(const AppendEntriesReply&)> cb) {
-    if (!can_communicate(from, to)) return; 
-    auto receiver_it = endpoints_.find(to);
-    if (receiver_it != endpoints_.end() && receiver_it->second->get_handlers().on_append_entries) {
-        AppendEntriesReply reply = receiver_it->second->get_handlers().on_append_entries(args);
-        if (can_communicate(to, from)) {
-            cb(reply);
-        }
-    }
-}
-
-inline void MockNetwork::route_install_snapshot(NodeId from, NodeId to, const InstallSnapshotArgs& args,
-                                                std::function<void(const InstallSnapshotReply&)> cb) {
-    if (!can_communicate(from, to)) return;
-    
-    auto receiver_it = endpoints_.find(to);
-    if (receiver_it != endpoints_.end() && receiver_it->second->get_handlers().on_install_snapshot) {
-        InstallSnapshotReply reply = receiver_it->second->get_handlers().on_install_snapshot(args);
-        if (can_communicate(to, from)) {
-            cb(reply);
-        }
-    }
-}
-
-} 
