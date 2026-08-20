@@ -48,6 +48,18 @@ public:
         handlers_[id] = std::move(h);
     }
 
+    // Simulate a node going down. Its handlers capture a pointer to the Raft
+    // instance, so they must be removed before that instance is destroyed;
+    // otherwise in-flight RPCs call into freed memory. Traffic to or from an
+    // unattached node is silently dropped, like a real unreachable peer.
+    void detach(NodeId id) {
+        handlers_.erase(id);
+    }
+
+    bool attached(NodeId id) const {
+        return handlers_.find(id) != handlers_.end();
+    }
+
     // Fault injection knobs the tests toggle
 
     // Isolate groups. Nodes can only talk to others in the same sub-vector
@@ -111,31 +123,31 @@ public:
                       std::function<Reply(const Args&)> rpc_handler,
                       std::function<void(const Reply&)> callback) {
 
-        if (!reachable(from, to) || should_drop()) return;
+        if (!attached(to) || !reachable(from, to) || should_drop()) return;
 
         uint64_t req_time = current_time_ + get_latency();
 
         // Schedule Request Delivery
         queue_.insert({req_time, [this, from, to, args, rpc_handler, callback]() {
-            // Re-check partitions at delivery time
-            if (!reachable(from, to)) return;
+            // Re-check partitions and liveness at delivery time
+            if (!attached(to) || !reachable(from, to)) return;
 
             // Execute on target node
             Reply reply = rpc_handler(args);
 
             // Schedule Reply Delivery
-            if (!reachable(to, from) || should_drop()) return;
+            if (!attached(from) || !reachable(to, from) || should_drop()) return;
 
             uint64_t rep_time = current_time_ + get_latency();
             queue_.insert({rep_time, [this, from, to, reply, callback]() {
-                // Re-check partitions at reply delivery time
-                if (!reachable(to, from)) return;
+                // Re-check partitions and liveness at reply delivery time
+                if (!attached(from) || !reachable(to, from)) return;
                 callback(reply);
             }});
         }});
     }
 
-    RpcHandlers& get_handlers(NodeId id) { return handlers_[id]; }
+    RpcHandlers& get_handlers(NodeId id) { return handlers_.at(id); }
 
 private:
     bool should_drop() {
@@ -178,7 +190,7 @@ public:
                            std::function<void(const RequestVoteReply&)> cb) override {
         net_->dispatch_rpc<RequestVoteArgs, RequestVoteReply>(
             self_, to, a,
-            [this, to](const RequestVoteArgs& args) { return net_->get_handlers(to).on_request_vote(args); },
+            [net = net_, to](const RequestVoteArgs& args) { return net->get_handlers(to).on_request_vote(args); },
             cb
         );
     }
@@ -187,7 +199,7 @@ public:
                              std::function<void(const AppendEntriesReply&)> cb) override {
         net_->dispatch_rpc<AppendEntriesArgs, AppendEntriesReply>(
             self_, to, a,
-            [this, to](const AppendEntriesArgs& args) { return net_->get_handlers(to).on_append_entries(args); },
+            [net = net_, to](const AppendEntriesArgs& args) { return net->get_handlers(to).on_append_entries(args); },
             cb
         );
     }
@@ -196,7 +208,7 @@ public:
                                std::function<void(const InstallSnapshotReply&)> cb) override {
         net_->dispatch_rpc<InstallSnapshotArgs, InstallSnapshotReply>(
             self_, to, a,
-            [this, to](const InstallSnapshotArgs& args) { return net_->get_handlers(to).on_install_snapshot(args); },
+            [net = net_, to](const InstallSnapshotArgs& args) { return net->get_handlers(to).on_install_snapshot(args); },
             cb
         );
     }

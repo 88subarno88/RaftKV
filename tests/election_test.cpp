@@ -176,12 +176,20 @@ TEST(Election, HigherTermCausesStepDown) {
 TEST(Election, RejectsVoteForStaleLog) {
     TestCluster c(3);
     c.run_for(500); // Wait for quiet cluster
-    auto& node = c.nodes[0]->raft;
+
+    // The proposal only takes effect on the leader, and node 0 is not
+    // necessarily the one elected, so find the real leader before proposing.
+    Raft* node = nullptr;
+    for (auto& n : c.nodes) {
+        if (n->raft->role() == Role::Leader) node = n->raft.get();
+    }
+    ASSERT_NE(node, nullptr) << "Cluster should have elected a leader";
+
     Term current = node->current_term();
-    // 1. Give Node 0 a log entry so its log is officially "longer/newer" 
+    // 1. Give it a log entry so its log is officially "longer/newer"
     Command dummy;
     dummy.op = Op::PUT;
-    node->propose(dummy); // Node 0's last_log_index is now 1, last_log_term is `current`
+    ASSERT_TRUE(node->propose(dummy).is_leader); // last_log_index is now 1, last_log_term is `current`
 
     // 2. Fabricate a RequestVote from a Candidate (Node 1) with a HIGHER term, 
     //    but an EMPTY log.

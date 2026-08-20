@@ -144,18 +144,41 @@ TEST(Linearizability, HoldsUnderRandomPartitions) {
         nodes.push_back(std::move(n));
     }
 
-    std::mt19937 rng(42); 
+    std::mt19937 rng(42);
     std::vector<Operation> history;
     int clock_ms = 0;
-    
+
     int next_client_id = 100;
     int client_seq = 1;
+
+    // Election timers must be independent and randomized per node. Firing them
+    // all on the same tick makes every node a candidate in the same term, the
+    // vote splits every round, and no leader is ever elected - which used to
+    // spin the retry loop below forever.
+    auto random_timeout = [&rng]() { return 150 + (int)(rng() % 150); };
+    std::vector<int> next_election(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) next_election[i] = random_timeout();
+
+    auto tick = [&]() {
+        clock_ms++;
+        net.step();
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            auto& node = nodes[i];
+            if (node->raft->role() == Role::Leader) {
+                if (clock_ms % 50 == 0) node->raft->on_heartbeat_tick();
+            } else if (clock_ms >= next_election[i]) {
+                node->raft->on_election_timeout();
+                next_election[i] = clock_ms + random_timeout();
+            }
+        }
+    };
 
     // Simulate 20 concurrent client requests under heavy duress
     for (int req = 0; req < 20; ++req) {
         int t_start = clock_ms;
-        
-        // Formulate a random command
+
+        // Formulate a random command. Each op gets its own client_id, so the
+        // state machine's session cache holds exactly this op's result.
         Command cmd;
         cmd.client_id = next_client_id++;
         cmd.seq_no = client_seq++;
@@ -174,70 +197,55 @@ TEST(Linearizability, HoldsUnderRandomPartitions) {
         bool applied = false;
         ApplyResult result;
 
-        // Keep retrying against the cluster until someone commits it
-        while (!applied) {
-            // Every 100ms, randomly scramble the network partitions
-            if (clock_ms % 100 == 0) {
-                if (rng() % 2 == 0) {
-                    net.heal();
-                } else {
-                    // Isolate Node 0 and 1 from 2, 3, and 4
-                    net.partition({{0, 1}, {2, 3, 4}});
-                }
+        // Keep retrying against the cluster until someone commits it. Bounded,
+        // so a cluster that cannot make progress fails the test instead of hanging.
+        for (int attempt = 0; attempt < 60 && !applied; ++attempt) {
+            // Randomly scramble the network partitions between attempts
+            if (rng() % 2 == 0) {
+                net.heal();
+            } else {
+                // Isolate Node 0 and 1 from 2, 3, and 4
+                net.partition({{0, 1}, {2, 3, 4}});
             }
 
             // Find someone who claims to be leader and propose
             for (auto& n : nodes) {
-                if (n->raft->role() == Role::Leader) {
-                    ProposeResult pr = n->raft->propose(cmd);
-                    if (pr.is_leader) {
-                        // Check if it got applied (In a real system we'd wait on a condition variable)
-                        // Here we just step time and check the State Machine directly.
-                        for (int wait = 0; wait < 100; ++wait) {
-                            clock_ms++;
-                            net.step();
-                            for (auto& node : nodes) {
-                                if (node->raft->role() == Role::Leader && clock_ms % 50 == 0) node->raft->on_heartbeat_tick();
-                                if (node->raft->role() != Role::Leader && clock_ms % 250 == 0) node->raft->on_election_timeout();
-                            }
-                            
-                            // Check if the state machine actually evaluated our specific deduplicated request
-                            // (We use a dummy GET to extract the current KV state without mutating it)
-                            ApplyResult sm_check = n->sm->apply(Command{Op::GET, "k", "", "", cmd.client_id, cmd.seq_no});
-                            
-                            // Since we intercept deduplication cache via client_id, if ok is returned, it means 
-                            // the network actually fully applied our original PUT/GET/CAS.
-                            if (sm_check.ok || !sm_check.ok) { // Hack to check if it's cached
-                                // To get the actual exact result of our operation, we re-apply it. 
-                                // The linearizability deduplication guarantees we get the exact cached result back.
-                                result = n->sm->apply(cmd); 
-                                applied = true;
-                                break;
-                            }
-                        }
+                if (n->raft->role() != Role::Leader) continue;
+                ProposeResult pr = n->raft->propose(cmd);
+                if (!pr.is_leader) continue;
+
+                for (int wait = 0; wait < 200 && !applied; ++wait) {
+                    tick();
+                    // Only trust the commit if this node still holds the same
+                    // leadership it proposed under. A node that stepped down may
+                    // have had its entry at pr.index overwritten by a new leader,
+                    // in which case commit_index says nothing about our command.
+                    if (n->raft->role() == Role::Leader &&
+                        n->raft->current_term() == pr.term &&
+                        n->raft->commit_index() >= pr.index) {
+                        // Raft already applied it. Re-applying the identical
+                        // command returns the cached result rather than
+                        // executing it a second time.
+                        result = n->sm->apply(cmd);
+                        applied = true;
                     }
-                    if (applied) break;
                 }
+                if (applied) break;
             }
 
-            // If no leader was found, step time to let elections run
+            // If nothing committed, step time to let elections run
             if (!applied) {
-                for (int wait = 0; wait < 300; ++wait) {
-                    clock_ms++;
-                    net.step();
-                    for (auto& node : nodes) {
-                        if (node->raft->role() != Role::Leader && clock_ms % 200 == 0) node->raft->on_election_timeout();
-                        if (node->raft->role() == Role::Leader && clock_ms % 50 == 0) node->raft->on_heartbeat_tick();
-                    }
-                }
+                for (int wait = 0; wait < 300; ++wait) tick();
             }
         }
 
+        ASSERT_TRUE(applied) << "Operation " << req << " never committed";
+
         int t_end = clock_ms;
-        
+
         // Log the operation to our history
         history.push_back({
-            req, cmd.op, cmd.key, cmd.value, cmd.expected, 
+            req, cmd.op, cmd.key, cmd.value, cmd.expected,
             result.ok, result.value, t_start, t_end
         });
     }

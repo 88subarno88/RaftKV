@@ -5,6 +5,7 @@
 #include "raftkv/transport.hpp"
 #include <filesystem>
 #include <fstream>
+#include <random>
 
 namespace raftkv {
 
@@ -138,8 +139,11 @@ public:
     std::unique_ptr<MockTransport> transport;
     std::unique_ptr<KVStateMachine> sm;
     std::unique_ptr<Raft> raft;
+    int next_election_time = 0;
     void boot(Network* net, const std::vector<NodeId>& peers) {
-        cfg.self_id = peers.back(); 
+        // cfg.self_id is assigned by the caller: overwriting it here gave every
+        // node the same id, so only one set of RPC handlers was ever registered
+        // and delivery to the others hit a default-constructed (empty) handler.
         cfg.cluster = peers;
         cfg.heartbeat = std::chrono::milliseconds(50);
         cfg.election_min = std::chrono::milliseconds(150);
@@ -166,14 +170,32 @@ TEST_F(PersistenceTest, NoAcknowledgedWriteLostOnLeaderKill) {
         node->boot(&net, peers);
         cluster.push_back(std::move(node));
     }
-    // Let them elect a leader
-    for (int i = 0; i < 500; ++i) {
-        net.step();
-        for (auto& n : cluster) {
-            if (n->raft->role() == Role::Leader && i % 50 == 0) n->raft->on_heartbeat_tick();
-            if (n->raft->role() != Role::Leader && i % 200 == 0) n->raft->on_election_timeout();
+    // Election timers must be randomized and independent per node. Firing them
+    // all on the same tick makes every node a candidate in the same term, which
+    // splits the vote every round and elects no one.
+    std::mt19937 rng(1337);
+    int clock_ticks = 0;
+    auto random_timeout = [&rng]() { return 15 + (int)(rng() % 15); };
+    for (auto& n : cluster) n->next_election_time = random_timeout();
+
+    auto pump = [&](int ticks) {
+        for (int i = 0; i < ticks; ++i) {
+            clock_ticks++;
+            net.step();
+            for (auto& n : cluster) {
+                if (!n) continue;
+                if (n->raft->role() == Role::Leader) {
+                    if (clock_ticks % 5 == 0) n->raft->on_heartbeat_tick();
+                } else if (clock_ticks >= n->next_election_time) {
+                    n->raft->on_election_timeout();
+                    n->next_election_time = clock_ticks + random_timeout();
+                }
+            }
         }
-    }
+    };
+
+    // Let them elect a leader
+    pump(500);
     NodeId leader_id = -1;
     for (auto& n : cluster) {
         if (n->raft->role() == Role::Leader) leader_id = n->cfg.self_id;
@@ -182,32 +204,31 @@ TEST_F(PersistenceTest, NoAcknowledgedWriteLostOnLeaderKill) {
     // Propose a write and wait for it to commit
     Command cmd{Op::PUT, "vital_data", "safe", "", 0, 0};
     ProposeResult prop = cluster[leader_id]->raft->propose(cmd);
-    for (int i = 0; i < 200; ++i) {
-        net.step();
-        if (i % 50 == 0) cluster[leader_id]->raft->on_heartbeat_tick();
-    }
+    pump(200);
     // Verify it committed before the crash
     ASSERT_EQ(cluster[leader_id]->raft->commit_index(), prop.index);
     // SIGKILL THE LEADER (Destroy all its volatile memory)
     std::string leader_dir = cluster[leader_id]->dir;
+    net.detach(leader_id);      // Node is off the network before its memory goes away
     cluster[leader_id].reset(); // The object is destroyed. Memory is wiped.
     // Let the survivors elect a new leader
-    for (int i = 0; i < 500; ++i) {
-        net.step();
-        for (auto& n : cluster) {
-            if (n) {
-                if (n->raft->role() == Role::Leader && i % 50 == 0) n->raft->on_heartbeat_tick();
-                if (n->raft->role() != Role::Leader && i % 200 == 0) n->raft->on_election_timeout();
-            }
-        }
-    }
+    pump(500);
     // RESTART THE DEAD NODE from its disk directory
     auto revived_node = std::make_unique<CrashableNode>();
     revived_node->cfg.self_id = leader_id;
     revived_node->dir = leader_dir;
     revived_node->boot(&net, peers);
-    // It should recover the state machine from the disk WAL automatically
-    ApplyResult res = revived_node->sm->apply(Command{Op::GET, "vital_data", "", "", 0, 0});
+    revived_node->next_election_time = clock_ticks + random_timeout();
+    // Put it back in the cluster so the drive loop services it again.
+    cluster[leader_id] = std::move(revived_node);
+
+    // start() recovers the durable WAL, but commit_index and the state machine
+    // are volatile and rebuilt from the log, not from disk. The node has to
+    // rejoin and learn the commit index from the current leader before it
+    // replays the entry, so give it time to catch up.
+    pump(500);
+
+    ApplyResult res = cluster[leader_id]->sm->apply(Command{Op::GET, "vital_data", "", "", 0, 0});
     // The Ultimate Proof
     EXPECT_TRUE(res.found);
     EXPECT_EQ(res.value, "safe") << "The acknowledged write survived the exact-moment crash!";
